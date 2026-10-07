@@ -1,0 +1,23 @@
+groups:
+  - name: todo-summary-assistant-alerts
+    rules:
+
+      - alert: TodoBackendDown
+        expr: up{job="todo-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: todo-backend
+        annotations:
+          summary: "Todo backend is down"
+          description: "The Todo Summary Assistant backend has been unreachable for more than 2 minutes."
+
+      - alert: TodoBackendHighCPU
+        expr: rate(container_cpu_usage_seconds_total{name="todo-backend"}[5m]) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          service: todo-backend
+        annotations:
+          summary: "Todo backend CPU usage is high"
+          description: "Todo backend container CPU usage has been above 80% for more than 5 minutes."
