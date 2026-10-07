@@ -1,0 +1,330 @@
+name: Todo Summary Assistant CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "What do you want to deploy?"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - frontend
+          - backend
+          - both
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 190512372294.dkr.ecr.ap-south-1.amazonaws.com
+
+  BACKEND_REPOSITORY: todo-summary-assistant-backend
+  FRONTEND_REPOSITORY: todo-summary-assistant-frontend
+
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+
+jobs:
+
+  # ==========================================
+  # BACKEND TEST
+  # ==========================================
+  test-backend:
+    name: Test Backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Make Maven wrapper executable
+        run: chmod +x Backend/todo-summary-assistant/mvnw
+
+      - name: Run backend tests
+        working-directory: Backend/todo-summary-assistant
+        run: ./mvnw clean test
+
+
+  # ==========================================
+  # FRONTEND TEST
+  # ==========================================
+  test-frontend:
+    name: Test Frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: Frontend/todo/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: Frontend/todo
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: Frontend/todo
+        run: npm test -- --watchAll=false --passWithNoTests
+
+
+  # ==========================================
+  # BACKEND BUILD + PUSH + DEPLOY
+  # ==========================================
+  deploy-backend:
+    name: Build and Deploy Backend
+    runs-on: ubuntu-latest
+    needs: test-backend
+
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+      (inputs.deploy == 'backend' || inputs.deploy == 'both'))
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build backend Docker image
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$BACKEND_REPOSITORY:${{ github.sha }} \
+            -t $ECR_REGISTRY/$BACKEND_REPOSITORY:latest \
+            -f Backend/todo-summary-assistant/Dockerfile \
+            Backend/todo-summary-assistant
+
+      - name: Push backend Docker image
+        run: |
+          docker push $ECR_REGISTRY/$BACKEND_REPOSITORY:${{ github.sha }}
+          docker push $ECR_REGISTRY/$BACKEND_REPOSITORY:latest
+
+      - name: Deploy backend to EC2
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_REPOSITORY }}:${{ github.sha }}
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > ec2_key
+          chmod 600 ec2_key
+
+          ssh -o StrictHostKeyChecking=no \
+            -i ec2_key \
+            $EC2_USER@$EC2_HOST \
+            "IMAGE='$IMAGE' AWS_REGION='$AWS_REGION' bash -s" << 'REMOTE_SCRIPT'
+
+          set -e
+
+          echo "Logging in to ECR..."
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            sudo docker login \
+            --username AWS \
+            --password-stdin 190512372294.dkr.ecr.ap-south-1.amazonaws.com
+
+          echo "Saving current backend image for rollback..."
+          OLD_IMAGE=$(sudo docker inspect \
+            --format='{{.Config.Image}}' \
+            todo-backend 2>/dev/null || true)
+
+          echo "Pulling new backend image..."
+          sudo docker pull "$IMAGE"
+
+          echo "Stopping old backend..."
+          sudo docker stop todo-backend 2>/dev/null || true
+          sudo docker rm todo-backend 2>/dev/null || true
+
+          echo "Starting new backend..."
+          sudo docker run -d \
+            --name todo-backend \
+            -p 8080:8080 \
+            --env-file .env \
+            "$IMAGE"
+
+          echo "Waiting for backend health check..."
+
+          HEALTHY=false
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/actuator/health > /dev/null; then
+              HEALTHY=true
+              break
+            fi
+
+            echo "Backend not ready yet... attempt $i/30"
+            sleep 5
+          done
+
+          if [ "$HEALTHY" = "true" ]; then
+            echo "Backend deployment successful."
+          else
+            echo "Backend health check failed."
+            echo "Rolling back..."
+
+            sudo docker stop todo-backend 2>/dev/null || true
+            sudo docker rm todo-backend 2>/dev/null || true
+
+            if [ -n "$OLD_IMAGE" ]; then
+              sudo docker run -d \
+                --name todo-backend \
+                -p 8080:8080 \
+                --env-file .env \
+                "$OLD_IMAGE"
+
+              echo "Backend rollback completed."
+            else
+              echo "No previous backend image available for rollback."
+            fi
+
+            exit 1
+          fi
+
+          REMOTE_SCRIPT
+
+          rm -f ec2_key
+
+
+  # ==========================================
+  # FRONTEND BUILD + PUSH + DEPLOY
+  # ==========================================
+  deploy-frontend:
+    name: Build and Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: test-frontend
+
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+      (inputs.deploy == 'frontend' || inputs.deploy == 'both'))
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build frontend Docker image
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$FRONTEND_REPOSITORY:${{ github.sha }} \
+            -t $ECR_REGISTRY/$FRONTEND_REPOSITORY:latest \
+            -f Frontend/todo/Dockerfile \
+            Frontend/todo
+
+      - name: Push frontend Docker image
+        run: |
+          docker push $ECR_REGISTRY/$FRONTEND_REPOSITORY:${{ github.sha }}
+          docker push $ECR_REGISTRY/$FRONTEND_REPOSITORY:latest
+
+      - name: Deploy frontend to EC2
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_REPOSITORY }}:${{ github.sha }}
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > ec2_key
+          chmod 600 ec2_key
+
+          ssh -o StrictHostKeyChecking=no \
+            -i ec2_key \
+            $EC2_USER@$EC2_HOST \
+            "IMAGE='$IMAGE' AWS_REGION='$AWS_REGION' bash -s" << 'REMOTE_SCRIPT'
+
+          set -e
+
+          echo "Logging in to ECR..."
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            sudo docker login \
+            --username AWS \
+            --password-stdin 190512372294.dkr.ecr.ap-south-1.amazonaws.com
+
+          echo "Saving current frontend image for rollback..."
+          OLD_IMAGE=$(sudo docker inspect \
+            --format='{{.Config.Image}}' \
+            todo-frontend 2>/dev/null || true)
+
+          echo "Pulling new frontend image..."
+          sudo docker pull "$IMAGE"
+
+          echo "Stopping old frontend..."
+          sudo docker stop todo-frontend 2>/dev/null || true
+          sudo docker rm todo-frontend 2>/dev/null || true
+
+          echo "Starting new frontend..."
+          sudo docker run -d \
+            --name todo-frontend \
+            -p 3001:80 \
+            "$IMAGE"
+
+          echo "Waiting for frontend health check..."
+
+          HEALTHY=false
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3001 > /dev/null; then
+              HEALTHY=true
+              break
+            fi
+
+            echo "Frontend not ready yet... attempt $i/30"
+            sleep 5
+          done
+
+          if [ "$HEALTHY" = "true" ]; then
+            echo "Frontend deployment successful."
+          else
+            echo "Frontend health check failed."
+            echo "Rolling back..."
+
+            sudo docker stop todo-frontend 2>/dev/null || true
+            sudo docker rm todo-frontend 2>/dev/null || true
+
+            if [ -n "$OLD_IMAGE" ]; then
+              sudo docker run -d \
+                --name todo-frontend \
+                -p 3001:80 \
+                "$OLD_IMAGE"
+
+              echo "Frontend rollback completed."
+            else
+              echo "No previous frontend image available for rollback."
+            fi
+
+            exit 1
+          fi
+
+          REMOTE_SCRIPT
+
+          rm -f ec2_key
