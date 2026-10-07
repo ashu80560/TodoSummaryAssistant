@@ -165,7 +165,7 @@ jobs:
           sudo docker run -d \
             --name todo-backend \
             -p 8080:8080 \
-            --env-file .env \
+            --env-file /home/ec2-user/TodoSummaryAssistant/.env \
             "$IMAGE"
 
           echo "Waiting for backend health check..."
